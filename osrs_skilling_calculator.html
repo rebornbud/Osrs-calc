@@ -1,0 +1,63 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OSRS Skilling Calculator</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: auto; }
+        label, select, input { display: block; margin-bottom: 10px; width: 100%; }
+        .result { margin-top: 20px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>OSRS Skilling Calculator - $ per XP</h2>
+
+    <label for="skill">Select Skill:</label>
+    <select id="skill">
+        <option value="cooking">Cooking ($0.005 per XP)</option>
+        <option value="fishing">Fishing ($0.007 per XP)</option>
+        <option value="woodcutting">Woodcutting ($0.004 per XP)</option>
+        <option value="herblore">Herblore ($0.010 per XP)</option>
+    </select>
+
+    <label for="currentXP">Current XP:</label>
+    <input type="number" id="currentXP" placeholder="Enter current XP">
+
+    <label for="targetXP">Target XP:</label>
+    <input type="number" id="targetXP" placeholder="Enter target XP">
+
+    <button onclick="calculateCost()">Calculate</button>
+
+    <div class="result" id="result"></div>
+
+    <script>
+        const rates = {
+            cooking: 0.005,
+            fishing: 0.007,
+            woodcutting: 0.004,
+            herblore: 0.010
+        };
+
+        function calculateCost() {
+            const skill = document.getElementById("skill").value;
+            const currentXP = parseFloat(document.getElementById("currentXP").value);
+            const targetXP = parseFloat(document.getElementById("targetXP").value);
+
+            if (isNaN(currentXP) || isNaN(targetXP) || targetXP <= currentXP) {
+                document.getElementById("result").innerText = "Please enter valid XP values.";
+                return;
+            }
+
+            const xpNeeded = targetXP - currentXP;
+            const costPerXP = rates[skill];
+            const totalCost = xpNeeded * costPerXP;
+
+            document.getElementById("result").innerHTML = `
+                XP Needed: ${xpNeeded.toLocaleString()} XP<br>
+                Cost per XP: $${costPerXP.toFixed(3)}<br>
+                Total Cost: <strong>$${totalCost.toFixed(2)}</strong>
+            `;
+        }
+    </script>
+</body>
+</html>
