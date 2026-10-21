@@ -88,6 +88,8 @@ class FakeDevice:
         self.after_tap_frames = 0
         self.taps = []
         self.keys = []
+        self.gestures = []
+        self.typed = []
         self.launches = 0
         self.launch_breaks_app = False
         self.online = True
@@ -154,9 +156,19 @@ class FakeDevice:
             if self.running:
                 return f"  mCurrentFocus=Window{{abc u0 {self.package}/.MainActivity}}\n"
             return "  mCurrentFocus=Window{abc u0 com.android.launcher3/.Launcher}\n"
+        if cmd.startswith("input motionevent"):
+            self.gestures.append(cmd)
+            return ""
+        if cmd.startswith("input text"):
+            self.typed.append(cmd)
+            return ""
         if cmd.startswith("input swipe"):
             parts = cmd.split()
             x, y, hold = int(parts[2]), int(parts[3]), int(parts[6])
+            x2, y2 = int(parts[4]), int(parts[5])
+            if (x, y) != (x2, y2):
+                self.gestures.append(cmd)
+                return ""
             self.taps.append((x, y, hold))
             tx, ty, tw, th = TARGET_BOX
             if self.screen == "home_target" and tx <= x < tx + tw and ty <= y < ty + th:
@@ -343,6 +355,120 @@ class AutomationFrameworkTests(unittest.TestCase):
         self.assertEqual(restored.to_dict(), data)
         with self.assertRaises(af.ConfigError):
             af.FrameworkConfig.from_dict({"vision": {"home_threshold": 1.5}})
+
+
+
+@unittest.skipIf(af is None, "opencv/numpy/pure-python-adb not installed")
+class ActionAndVisionTests(unittest.TestCase):
+    def setUp(self):
+        self.device = FakeDevice("com.test.app")
+        FakeClient.device = self.device
+        self._orig_client = af.AdbClient
+        af.AdbClient = FakeClient
+        logging.getLogger("automation").setLevel(logging.CRITICAL + 1)
+        self.config = af.FrameworkConfig()
+        self.adb = af.AdbEngine(self.config, threading.Event())
+        self.adb.connect_device()
+
+    def tearDown(self):
+        af.AdbClient = self._orig_client
+
+    def test_swipe_is_one_continuous_motionevent_gesture(self):
+        points = self.adb.send_humanized_swipe(100, 500, 120, 150)
+        self.assertEqual(len(self.device.gestures), 1)
+        steps = self.device.gestures[0].split("; ")
+        self.assertTrue(steps[0].startswith("input motionevent DOWN 100 500"))
+        self.assertTrue(steps[-1].startswith("input motionevent UP 120 150"))
+        self.assertEqual(sum(step.startswith("input motionevent MOVE") for step in steps), points - 1)
+        for step in steps:
+            if step.startswith("input motionevent"):
+                x, y = int(step.split()[3]), int(step.split()[4])
+                self.assertTrue(0 <= x < WIDTH and 0 <= y < HEIGHT)
+
+    def test_swipe_falls_back_to_straight_input_swipe(self):
+        self.adb.supports_motionevent = False
+        self.assertEqual(self.adb.send_humanized_swipe(100, 500, 120, 150), 2)
+        parts = self.device.gestures[0].split()
+        self.assertEqual(parts[:6], ["input", "swipe", "100", "500", "120", "150"])
+        self.assertTrue(280 <= int(parts[6]) <= 520)
+
+    def test_long_press_hold_range(self):
+        for _ in range(50):
+            _x, _y, hold = self.adb.send_humanized_long_press(180, 320, 60, 60)
+            self.assertTrue(650 <= hold <= 1100)
+        _x, _y, hold = self.adb.send_humanized_long_press(180, 320, 60, 60, hold_ms=2000)
+        self.assertEqual(hold, 2000)
+
+    def test_text_is_escaped_for_input_and_shell(self):
+        self.adb.send_text("hi there; rm -rf x")
+        self.assertEqual(self.device.typed[-1], "input text 'hi%sthere;%srm%s-rf%sx'")
+        with self.assertRaises(ValueError):
+            self.adb.send_text("caf\u00e9")
+
+    def test_invalid_action_config_rejected(self):
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"workflow_targets": [
+                {"name": "a", "template": "a.png", "action": "pinch"}]})
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"workflow_targets": [
+                {"name": "a", "template": "a.png", "action": "text"}]})
+
+    def test_multi_scale_matching_finds_resized_template(self):
+        screen = np.full((HEIGHT, WIDTH, 3), 30, dtype=np.uint8)
+        cv2.circle(screen, (180, 300), 40, (40, 200, 240), -1)
+        cv2.rectangle(screen, (150, 330), (215, 360), (230, 90, 20), -1)
+        cv2.putText(screen, "GO", (160, 312), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "button.png")
+            small = cv2.resize(screen[250:380, 120:240], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            cv2.imwrite(path, small)
+            exact_only = af.VisionEngine(self.config)
+            self.assertIsNone(exact_only.find_template(screen, path, 0.9))
+            self.config.vision.match_scales = [1.0, 2.0]
+            multi = af.VisionEngine(self.config)
+            match = multi.find_template(screen, path, 0.9)
+            self.assertIsNotNone(match)
+            self.assertLessEqual(abs(match.cx - 180), 3)
+            self.assertLessEqual(abs(match.cy - 315), 3)
+            self.assertEqual((match.w, match.h), (120, 130))
+
+
+@unittest.skipIf(af is None, "opencv/numpy/pure-python-adb not installed")
+class CaptureAssetsTests(unittest.TestCase):
+    def setUp(self):
+        import capture_assets
+        self.tool = capture_assets
+        self.tmp = tempfile.TemporaryDirectory()
+        self.screen = os.path.join(self.tmp.name, "screen.png")
+        cv2.imwrite(self.screen, render("home_target"))
+        self.config = os.path.join(self.tmp.name, "config.json")
+        with open(self.config, "w") as handle:
+            json.dump({"assets": {"assets_dir": os.path.join(self.tmp.name, "assets")}}, handle)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_tool(self, *argv):
+        return self.tool.main(["--config", self.config, "--from", self.screen, *argv])
+
+    def test_crop_then_test_round_trip(self):
+        x, y, w, h = TARGET_BOX
+        self.assertEqual(self.run_tool("crop", "target", str(x), str(y), str(w), str(h)), 0)
+        saved = os.path.join(self.tmp.name, "assets", "target.png")
+        self.assertTrue(np.array_equal(cv2.imread(saved), render("home_target")[y:y + h, x:x + w]))
+        annotated = os.path.join(self.tmp.name, "annotated.png")
+        self.assertEqual(self.run_tool("test", "target", "--annotate", annotated), 0)
+        self.assertTrue(os.path.isfile(annotated))
+
+    def test_crop_refuses_overwrite_and_flat_regions(self):
+        x, y, w, h = HOME_BOX
+        self.assertEqual(self.run_tool("crop", "home", str(x), str(y), str(w), str(h)), 0)
+        self.assertEqual(self.run_tool("crop", "home", str(x), str(y), str(w), str(h)), 3)
+        self.assertEqual(self.run_tool("crop", "flat", "200", "10", "50", "50"), 3)
+        self.assertEqual(self.run_tool("crop", "outside", "300", "600", "100", "100"), 3)
+
+    def test_missing_template_fails(self):
+        self.assertEqual(self.run_tool("test", "nope"), 3)
 
 
 if __name__ == "__main__":

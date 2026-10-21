@@ -24,6 +24,7 @@ import logging
 import os
 import platform
 import random
+import shlex
 import shutil
 import signal
 import socket
@@ -43,6 +44,8 @@ import cv2
 import numpy as np
 from ppadb.client import Client as AdbClient
 
+from human_swipe import bezier_path, build_drag_script
+
 
 # =============================================================================
 # SECTION 1: GLOBAL CONFIGURATION & DATA STRUCTURES
@@ -57,6 +60,13 @@ EXIT_FATAL = 2
 EXIT_INTERRUPTED = 130
 
 DEFAULT_PACKAGE_NAME = "com.example.app"
+
+WORKFLOW_ACTIONS = frozenset({"tap", "long_press", "swipe", "text"})
+
+
+def is_typable_text(text: str) -> bool:
+    """`input text` only handles printable ASCII reliably."""
+    return all(32 <= ord(char) < 127 for char in text)
 
 
 class ConfigError(Exception):
@@ -115,6 +125,9 @@ class VisionSettings:
     ui_change_min_ratio: float = 0.004
     # Downscale factor used for change detection (speed versus precision).
     ui_change_downscale: float = 0.5
+    # Template scales to try. [1.0] = exact resolution only; add e.g. 0.75 and
+    # 1.5 to match templates captured on a device of different density.
+    match_scales: List[float] = field(default_factory=lambda: [1.0])
 
 
 @dataclass
@@ -165,7 +178,16 @@ class WorkflowTarget:
     name: str
     template: str
     threshold: Optional[float] = None
-    # Seconds to wait after tapping before verifying the UI changed.
+    # "tap", "long_press", "swipe" (starts on the match) or "text" (taps the
+    # match to focus it, then types `text`).
+    action: str = "tap"
+    # Hold duration for long_press; None picks 650-1100 ms.
+    long_press_ms: Optional[int] = None
+    # Swipe vector as fractions of the screen size: [dx, dy]. [0, -0.4] drags
+    # up by 40% of the screen height.
+    swipe_vector: List[float] = field(default_factory=lambda: [0.0, -0.4])
+    text: Optional[str] = None
+    # Seconds to wait after the action before verifying the UI changed.
     post_action_delay_seconds: float = 1.2
     verify_change: bool = True
 
@@ -187,6 +209,12 @@ class TimingSettings:
     # "motionevent": DOWN; sleep; UP (Android 10+; each `input` call adds JVM
     # start-up latency, so the effective hold is longer than requested).
     tap_mode: str = "swipe_hold"
+    # Gaps between Bezier drag steps (motionevent mode only).
+    swipe_step_min_delay_seconds: float = 0.008
+    swipe_step_max_delay_seconds: float = 0.025
+    # Straight-line `input swipe` duration when motionevent is unavailable.
+    swipe_fallback_min_ms: int = 280
+    swipe_fallback_max_ms: int = 520
     exception_backoff_seconds: float = 2.0
 
 
@@ -299,6 +327,24 @@ class FrameworkConfig:
         names = [target.name for target in self.workflow_targets]
         if len(names) != len(set(names)):
             errors.append("workflow_targets names must be unique")
+        for target in self.workflow_targets:
+            label = f"workflow_targets[{target.name}]"
+            if target.action not in WORKFLOW_ACTIONS:
+                errors.append(f"{label}.action must be one of {sorted(WORKFLOW_ACTIONS)}")
+            if target.action == "text":
+                if not target.text:
+                    errors.append(f"{label}.text is required for the text action")
+                elif not is_typable_text(target.text):
+                    errors.append(f"{label}.text must be printable ASCII (`input text` limitation)")
+            if target.action == "swipe" and (len(target.swipe_vector) != 2 or
+                                             not all(-1.0 <= v <= 1.0 for v in target.swipe_vector)):
+                errors.append(f"{label}.swipe_vector must be [dx, dy] fractions in [-1, 1]")
+            if target.long_press_ms is not None and target.long_press_ms < 300:
+                errors.append(f"{label}.long_press_ms must be >= 300")
+        if not self.vision.match_scales or not all(0.2 <= s <= 4.0 for s in self.vision.match_scales):
+            errors.append("vision.match_scales must be a non-empty list of values in [0.2, 4]")
+        if not 0 < self.timing.swipe_fallback_min_ms <= self.timing.swipe_fallback_max_ms:
+            errors.append("timing.swipe_fallback_min_ms must be > 0 and <= swipe_fallback_max_ms")
         if errors:
             raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errors))
 
@@ -697,12 +743,15 @@ class AdbEngine:
 
     # -------------------------------------------------------------------- input
 
-    def send_humanized_tap(self, cx: int, cy: int, w: int, h: int) -> Tuple[int, int, int]:
-        """Tap inside the box centred on (cx, cy) with size (w, h).
+    def _clamp_to_screen(self, x: float, y: float) -> Tuple[int, int]:
+        return (int(round(min(max(x, 0), max(self.screen_width - 1, 0)))),
+                int(round(min(max(y, 0), max(self.screen_height - 1, 0)))))
+
+    def humanized_point(self, cx: int, cy: int, w: int, h: int) -> Tuple[int, int]:
+        """A point inside the box centred on (cx, cy) with size (w, h).
 
         The point follows a normal distribution around the centre (sigma = 1/6 of
         the box) and is resampled until it falls in the inner 80% of the box.
-        Returns the (x, y, hold_ms) actually sent.
         """
         half_w = max(1.0, w * 0.4)
         half_h = max(1.0, h * 0.4)
@@ -717,10 +766,16 @@ class AdbEngine:
                 x = candidate_x
                 y = candidate_y
                 break
-        tap_x = int(round(min(max(x, 0), max(self.screen_width - 1, 0))))
-        tap_y = int(round(min(max(y, 0), max(self.screen_height - 1, 0))))
+        return self._clamp_to_screen(x, y)
+
+    def send_humanized_tap(self, cx: int, cy: int, w: int, h: int,
+                           hold_ms: Optional[int] = None) -> Tuple[int, int, int]:
+        """Press a humanized point inside the box. hold_ms defaults to a random
+        value in [tap_hold_min_ms, tap_hold_max_ms]. Returns (x, y, hold_ms)."""
+        tap_x, tap_y = self.humanized_point(cx, cy, w, h)
         timing = self.config.timing
-        hold_ms = self._rng.randint(timing.tap_hold_min_ms, timing.tap_hold_max_ms)
+        if hold_ms is None:
+            hold_ms = self._rng.randint(timing.tap_hold_min_ms, timing.tap_hold_max_ms)
 
         if timing.tap_mode == "motionevent" and self.supports_motionevent:
             command = (f"input motionevent DOWN {tap_x} {tap_y}; "
@@ -732,6 +787,40 @@ class AdbEngine:
         self.log.debug("Tap (%d, %d) hold %dms inside box c=(%d, %d) %dx%d",
                        tap_x, tap_y, hold_ms, cx, cy, w, h)
         return tap_x, tap_y, hold_ms
+
+    def send_humanized_long_press(self, cx: int, cy: int, w: int, h: int,
+                                  hold_ms: Optional[int] = None) -> Tuple[int, int, int]:
+        if hold_ms is None:
+            hold_ms = self._rng.randint(650, 1100)
+        return self.send_humanized_tap(cx, cy, w, h, hold_ms=hold_ms)
+
+    def send_humanized_swipe(self, x1: int, y1: int, x2: int, y2: int) -> int:
+        """Drag from (x1, y1) to (x2, y2). Uses one continuous Bezier-curved
+        touch when `input motionevent` exists, else a straight `input swipe`.
+        Returns the number of path points sent."""
+        timing = self.config.timing
+        start = self._clamp_to_screen(x1, y1)
+        end = self._clamp_to_screen(x2, y2)
+        if self.supports_motionevent:
+            points = bezier_path(start[0], start[1], end[0], end[1])
+            points = [self._clamp_to_screen(px, py) for px, py in points]
+            command = build_drag_script(points, timing.swipe_step_min_delay_seconds,
+                                        timing.swipe_step_max_delay_seconds)
+            # Each `input` call costs a JVM start, so allow generously for long paths.
+            self.shell(command, timeout=self.config.adb.shell_timeout_seconds + len(points) * 0.5)
+        else:
+            points = [start, end]
+            duration = self._rng.randint(timing.swipe_fallback_min_ms, timing.swipe_fallback_max_ms)
+            self.shell(f"input swipe {start[0]} {start[1]} {end[0]} {end[1]} {duration}")
+        self.log.debug("Swipe %s -> %s (%d points)", start, end, len(points))
+        return len(points)
+
+    def send_text(self, text: str) -> None:
+        if not text or not is_typable_text(text):
+            raise ValueError(f"`input text` needs non-empty printable ASCII, got {text!r}")
+        # `input text` treats %s as a space; shlex protects the device shell.
+        self.shell(f"input text {shlex.quote(text.replace(' ', '%s'))}")
+        self.log.debug("Typed %d characters", len(text))
 
     def send_key_event(self, keycode: int) -> None:
         if not isinstance(keycode, int) or keycode < 0:
@@ -881,29 +970,49 @@ class VisionEngine:
         template = self.load_template(template_path)
         if template is None:
             return None
-        template_h, template_w = template.shape[:2]
         screen_h, screen_w = screenshot.shape[:2]
-        if template_h > screen_h or template_w > screen_w:
+        best: Optional[MatchResult] = None
+        for scale in self.config.vision.match_scales:
+            scaled = self._scaled_template(template_path, template, scale)
+            template_h, template_w = scaled.shape[:2]
+            if template_h > screen_h or template_w > screen_w or min(template_h, template_w) < 4:
+                continue
+            # Multi-channel matching: OpenCV sums the correlation over B, G and R.
+            scores = cv2.matchTemplate(screenshot, scaled, cv2.TM_CCOEFF_NORMED)
+            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(scores)
+            if not np.isfinite(max_val):
+                # A flat (zero-variance) template produces undefined scores.
+                self._warn_once(f"flat:{template_path}",
+                                "Template %s has no texture; matching is unreliable", template_path)
+                continue
+            if best is None or max_val > best.confidence:
+                top_left_x, top_left_y = max_loc
+                best = MatchResult(
+                    cx=int(top_left_x + template_w // 2),
+                    cy=int(top_left_y + template_h // 2),
+                    w=int(template_w),
+                    h=int(template_h),
+                    confidence=float(max_val),
+                )
+        if best is None:
+            template_h, template_w = template.shape[:2]
             self._warn_once(f"size:{template_path}",
-                            "Template %s (%dx%d) larger than screen (%dx%d); recapture it at device resolution",
-                            template_path, template_w, template_h, screen_w, screen_h)
-            return None
-        # Multi-channel matching: OpenCV sums the correlation over B, G and R.
-        scores = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
-        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(scores)
-        if not np.isfinite(max_val):
-            # A flat (zero-variance) template produces undefined scores.
-            self._warn_once(f"flat:{template_path}",
-                            "Template %s has no texture; matching is unreliable", template_path)
-            return None
-        top_left_x, top_left_y = max_loc
-        return MatchResult(
-            cx=int(top_left_x + template_w // 2),
-            cy=int(top_left_y + template_h // 2),
-            w=int(template_w),
-            h=int(template_h),
-            confidence=float(max_val),
-        )
+                            "Template %s (%dx%d) cannot be matched on a %dx%d screen at scales %s",
+                            template_path, template_w, template_h, screen_w, screen_h,
+                            self.config.vision.match_scales)
+        return best
+
+    def _scaled_template(self, template_path: str, template: np.ndarray, scale: float) -> np.ndarray:
+        if scale == 1.0:
+            return template
+        key = f"{template_path}@{scale}"
+        with self._lock:
+            cached = self._templates.get(key)
+            if cached is None:
+                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+                cached = cv2.resize(template, None, fx=scale, fy=scale, interpolation=interpolation)
+                self._templates[key] = cached
+            return cached
 
     def hsv_ratio(self, screenshot: np.ndarray, hsv_range: HsvRange, roi: List[float]) -> float:
         screen_h, screen_w = screenshot.shape[:2]
@@ -1305,8 +1414,7 @@ class AutomationController:
         before: np.ndarray = pending["frame"]
 
         self.humanized_delay(scale=0.5)
-        tap_x, tap_y, hold_ms = self.adb.send_humanized_tap(match.cx, match.cy, match.w, match.h)
-        self.log.info("ACTION '%s': tap (%d, %d) hold %dms", target.name, tap_x, tap_y, hold_ms)
+        self._perform_action(target, match)
 
         self.stop_event.wait(target.post_action_delay_seconds)
         after = self.capture()
@@ -1328,6 +1436,30 @@ class AutomationController:
             return self._enter_recovery(RecoveryReason.FROZEN,
                                         f"{unresponsive} consecutive taps had no visible effect")
         return State.STATE_SCANNING
+
+    def _perform_action(self, target: WorkflowTarget, match: MatchResult) -> None:
+        if target.action == "tap":
+            x, y, hold_ms = self.adb.send_humanized_tap(match.cx, match.cy, match.w, match.h)
+            self.log.info("ACTION '%s': tap (%d, %d) hold %dms", target.name, x, y, hold_ms)
+        elif target.action == "long_press":
+            x, y, hold_ms = self.adb.send_humanized_long_press(match.cx, match.cy, match.w, match.h,
+                                                               target.long_press_ms)
+            self.log.info("ACTION '%s': long press (%d, %d) hold %dms", target.name, x, y, hold_ms)
+        elif target.action == "swipe":
+            x1, y1 = self.adb.humanized_point(match.cx, match.cy, match.w, match.h)
+            x2 = x1 + target.swipe_vector[0] * self.adb.screen_width
+            y2 = y1 + target.swipe_vector[1] * self.adb.screen_height
+            points = self.adb.send_humanized_swipe(x1, y1, int(x2), int(y2))
+            self.log.info("ACTION '%s': swipe (%d, %d) -> (%d, %d), %d points",
+                          target.name, x1, y1, x2, y2, points)
+        elif target.action == "text":
+            x, y, _hold = self.adb.send_humanized_tap(match.cx, match.cy, match.w, match.h)
+            self.humanized_delay(scale=0.6)
+            self.adb.send_text(target.text or "")
+            self.log.info("ACTION '%s': focused (%d, %d) and typed %d chars",
+                          target.name, x, y, len(target.text or ""))
+        else:
+            raise ValueError(f"Unknown action {target.action!r} for target {target.name}")
 
     # -------------------------------------------------- STATE: ERROR_RECOVERY
 

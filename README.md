@@ -66,7 +66,41 @@ python3 automation_framework.py --config config.json
    - `home_anchor.png`: something always visible on the main screen
    - `loading_anchor.png`: the loading screen (or enable `vision.loading_hsv_enabled`)
    - `network_disconnect_dialog.png` and, optionally, `network_retry_button.png`
-3. List the elements to tap in `workflow_targets`, in priority order.
+3. List the elements to act on in `workflow_targets`, in priority order.
+
+### Capturing templates
+
+`capture_assets.py` uses the same config, so templates are saved to `assets_dir` and checked
+with the thresholds and scales the framework will use:
+
+```bash
+python3 capture_assets.py --config config.json screenshot screen.png        # full frame from the device
+python3 capture_assets.py --config config.json crop home_anchor 20 20 120 60 # pixel box → assets/home_anchor.png
+python3 capture_assets.py --config config.json select confirm_button         # drag a box (GUI OpenCV only)
+python3 capture_assets.py --config config.json test home_anchor confirm_button --annotate check.png
+```
+
+`crop` and `select` refuse flat-colour regions and warn when the template also matches somewhere
+else on the same screen. `--from screen.png` works on a saved screenshot instead of the device.
+
+### Workflow actions
+
+| `action` | Behaviour | Extra fields |
+|---|---|---|
+| `tap` (default) | Gaussian-offset press, 80–150 ms | |
+| `long_press` | same point sampling, 650–1100 ms hold | `long_press_ms` |
+| `swipe` | Bezier drag (from `human_swipe.py`) starting on the match; straight `input swipe` without `motionevent` | `swipe_vector: [dx, dy]` as screen fractions |
+| `text` | taps the match to focus it, then `input text` (printable ASCII only) | `text` |
+
+```json
+{"name": "scroll_feed", "template": "feed_header.png", "action": "swipe", "swipe_vector": [0.0, -0.45]}
+```
+
+### Different resolutions
+
+Templates must normally be captured at the device's resolution. To reuse them across emulators
+with a different screen density, add scales such as `"vision": {"match_scales": [1.0, 0.75, 1.5]}`.
+Each extra scale costs another full matching pass per template.
 
 ## State machine
 
