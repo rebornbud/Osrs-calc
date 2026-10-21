@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+crash_dumps/
+automation.log
+config.json

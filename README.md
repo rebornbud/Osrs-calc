@@ -42,5 +42,46 @@ human_drag(200, 1500, 900, 600, seed=42)
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests   # framework tests need requirements.txt installed
 ```
+
+---
+
+# automation_framework.py
+
+A long-running Android UI automation loop for emulators, built on `pure-python-adb`, OpenCV
+template matching and a finite state machine with tiered recovery.
+
+```bash
+pip install -r requirements.txt
+python3 automation_framework.py --write-default-config config.json   # edit package + targets
+python3 automation_framework.py --config config.json
+```
+
+## Setup
+
+1. Set `package.package_name` (and `main_activity`, used only if the Monkey launch fails).
+2. Capture template PNGs **at the device's resolution** (crop from `adb exec-out screencap -p`)
+   and place them in `assets.assets_dir`:
+   - `home_anchor.png`: something always visible on the main screen
+   - `loading_anchor.png`: the loading screen (or enable `vision.loading_hsv_enabled`)
+   - `network_disconnect_dialog.png` and, optionally, `network_retry_button.png`
+3. List the elements to tap in `workflow_targets`, in priority order.
+
+## State machine
+
+| State | Does | Leaves to |
+|---|---|---|
+| `INITIALIZE` | connect (with backoff, auto `adb start-server`), launch app if needed, find start screen | `SCANNING` |
+| `SCANNING` | health check every N scans (process, focus, ANR), network dialog, loading, workflow targets | `ACTION` / `ERROR_RECOVERY` |
+| `ACTION` | Gaussian tap inside the matched box, verify the screen changed | `SCANNING` / `ERROR_RECOVERY` (frozen) |
+| `ERROR_RECOVERY` | Tier 1: Back ×2 + Home check · Tier 2: force-stop, Monkey launch, await Home (40 s) · Tier 3: crash dump + exit | `SCANNING` / exit |
+
+Hard faults (app not running, ANR, frozen taps, stuck loading, failed launch) skip Tier 1.
+A dropped ADB link from any state goes back to `INITIALIZE`. Crash dumps (`crash_dumps/`) contain
+the context, state history, last traceback, config, last screenshot and a logcat tail.
+
+`recovery.restart_counter_decay_seconds` resets the restart counter after a stable period so that
+runs lasting several days do not slowly drift towards Tier 3. Set it to `0` to make the restart limit absolute.
+
+Exit codes: `0` normal, `1` config error, `2` Tier 3 fatal, `130` interrupted.
