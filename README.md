@@ -83,6 +83,34 @@ python3 screen_locator.py icon.png --benchmark 20 --backend exec-out     # ms pe
 
 ---
 
+# ui_loop.py
+
+A find → interact → check UI test loop that joins `screen_locator.py` and `human_swipe.py`
+behind one `Device` interface. `AdbDevice` is the real implementation. Tests drive the same loop with
+a scripted fake device on a simulated clock.
+
+```bash
+python3 ui_loop.py --write-example-config ui_loop.json    # set templates, ROIs, capacity
+python3 ui_loop.py --config ui_loop.json --serial emulator-5554 --log-level DEBUG --log-file run.log
+```
+
+| State | Does | On failure |
+|---|---|---|
+| `IDLE` | short pause | |
+| `FIND_OBJECT` | polls for the target (`find_timeout`), then retries `find_retries` times with exponential backoff, to tolerate lag and slow transitions | `RECOVER` |
+| `INTERACT` | taps the match (or swipes it along a Bezier curve), then polls until the screen changes (`interact_timeout`) | re-locates and retries up to `max_interact_attempts`, then `RECOVER` |
+| `CHECK_INVENTORY` | counts `inventory.item_template` matches in its ROI; at `capacity`, stops (or continues with `on_full: "continue"`) | |
+| `RECOVER` | Back key, then waits for `home_template` (if set) | after `max_recoveries` in a row: stop, exit code 2 |
+
+- **Watchdog:** no successful interaction for `stall_timeout` sends the loop to `RECOVER`, even
+  while each state's own timeout keeps getting reset.
+- **Errors:** device and ADB errors are caught inside the state that raised them and become a
+  recovery. Each failure saves the current screenshot to `debug_dir`.
+- **Logging:** each state change, retry and recovery is logged with timing. At the end it logs a summary
+  of the counters and the time spent in each state.
+
+---
+
 # automation_framework.py
 
 A long-running Android UI automation loop for emulators, built on `pure-python-adb`, OpenCV

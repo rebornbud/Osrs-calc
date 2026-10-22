@@ -4,3 +4,4 @@ __pycache__/
 crash_dumps/
 automation.log
 config.json
+ui_loop_debug/
