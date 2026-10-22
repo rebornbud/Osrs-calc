@@ -47,6 +47,42 @@ python3 -m unittest discover -s tests   # framework tests need requirements.txt 
 
 ---
 
+# screen_locator.py
+
+A standalone module, needing only `opencv-python` and `numpy` plus `adb` on your `PATH`. It provides
+fast screen capture and template location that returns a randomized click point inside the match.
+
+```python
+from screen_locator import open_capture, TemplateLocator
+
+with open_capture(serial="emulator-5554") as capture:          # minicap if installed, else exec-out
+    locator = TemplateLocator(capture)
+    hit = locator.locate("assets/inventory_icon.png", threshold=0.88)
+    if hit:
+        print(hit.cx, hit.cy, hit.box, hit.confidence)
+        x, y = hit.click_point()                                 # Gaussian, always inside the box
+    slots = locator.locate_all("assets/inventory_icon.png", roi=(600, 900, 400, 560), refresh=False)
+```
+
+- **Capture:** `exec-out screencap` reads raw RGBA, which skips PNG encoding and is the
+  fastest option that works everywhere. `minicap` streams JPEG frames, so `grab()` returns the newest
+  frame almost instantly. It needs the `minicap` binary and `minicap.so` for your device's ABI/SDK
+  pushed to `/data/local/tmp`, and upstream builds don't cover the newest Android versions. `auto`
+  tries minicap and falls back to exec-out.
+- **Matching:** `TM_CCOEFF_NORMED`, with optional `roi` (search one region only; much faster),
+  `scales`, `grayscale` and PNG alpha masks (transparent pixels are ignored, so an icon matches over any
+  background). `find_all` / `locate_all` return every match, such as each inventory slot holding an
+  item. Overlapping duplicates are removed.
+- **Click point:** normal distribution around the centre (σ = 1/6 of the box), clipped to the
+  inner 70%, so it never lands on an edge.
+
+```bash
+python3 screen_locator.py icon.png --all --roi 600 900 400 560 --annotate found.png
+python3 screen_locator.py icon.png --benchmark 20 --backend exec-out     # ms per frame
+```
+
+---
+
 # automation_framework.py
 
 A long-running Android UI automation loop for emulators, built on `pure-python-adb`, OpenCV
