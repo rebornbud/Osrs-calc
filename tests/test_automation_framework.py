@@ -343,6 +343,67 @@ class AutomationFrameworkTests(unittest.TestCase):
         self.assertEqual(self.controller.state, af.State.STATE_SCANNING)
         self.assertTrue(self.adb.is_connected())
 
+    def rebuild_controller(self):
+        self.controller = af.AutomationController(self.config, self.adb, af.VisionEngine(self.config),
+                                                  self.stop, label="emu")
+
+    def add_ghost_target(self, optional):
+        cv2.imwrite(self.config.assets.resolve("ghost.png"), _patch(55, 60, 60))
+        self.config.workflow_targets.append(af.WorkflowTarget(
+            name="ghost", template="ghost.png", optional=optional, post_action_delay_seconds=0.0))
+
+    def test_sequence_skips_optional_step_and_stops_after_max_cycles(self):
+        self.config.workflow.mode = "sequence"
+        self.config.workflow.max_cycles = 2
+        self.add_ghost_target(optional=True)
+        self.config.validate()
+        self.rebuild_controller()
+        self.assertEqual(self.controller.run(), af.EXIT_OK)
+        snap = self.controller.snapshot()
+        self.assertEqual(snap["cycles_completed"], 2)
+        self.assertEqual(snap["actions_performed"], 2)
+        self.assertEqual(self.controller.state, af.State.STATE_SHUTDOWN)
+        self.assertEqual(snap["recoveries_tier1"] + snap["recoveries_tier2"], 0)
+
+    def test_sequence_waits_on_required_step(self):
+        self.config.workflow.mode = "sequence"
+        self.add_ghost_target(optional=False)
+        self.rebuild_controller()
+        self.cycles(3)  # initialize, scan (target found), action
+        self.assertEqual(self.controller.snapshot()["current_step"], "ghost")
+        self.cycles(2)
+        self.assertEqual(self.controller.ctx_get("ui_failure_counter"), 2)
+        self.assertEqual(self.controller.ctx_get("actions_performed"), 1)
+
+    def test_priority_mode_stops_after_max_actions(self):
+        self.config.workflow.max_actions = 3
+        self.rebuild_controller()
+        self.assertEqual(self.controller.run(), af.EXIT_OK)
+        self.assertEqual(self.controller.ctx_get("actions_performed"), 3)
+
+    def test_status_server_serves_json_html_and_screenshot(self):
+        import urllib.error
+        import urllib.request
+        self.rebuild_controller()
+        self.cycles(2)
+        server = af.StatusServer("127.0.0.1", 0, {"emu": self.controller})
+        server.start()
+        try:
+            with urllib.request.urlopen(server.url + "status.json", timeout=5) as response:
+                payload = json.load(response)
+            self.assertEqual(payload["devices"]["emu"]["state"], "ACTION")
+            self.assertEqual(payload["devices"]["emu"]["serial"], "emulator-5554")
+            with urllib.request.urlopen(server.url, timeout=5) as response:
+                self.assertIn(b"Automation status", response.read())
+            with urllib.request.urlopen(server.url + "screenshot/emu.png", timeout=5) as response:
+                image = cv2.imdecode(np.frombuffer(response.read(), np.uint8), cv2.IMREAD_COLOR)
+            self.assertEqual(image.shape, (HEIGHT, WIDTH, 3))
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(server.url + "screenshot/nope.png", timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+        finally:
+            server.stop()
+
     def test_unreachable_daemon_is_fatal_after_reconnect_cycles(self):
         self.device.online = False
         self.config.adb.auto_start_server = False
@@ -431,6 +492,44 @@ class ActionAndVisionTests(unittest.TestCase):
             self.assertLessEqual(abs(match.cx - 180), 3)
             self.assertLessEqual(abs(match.cy - 315), 3)
             self.assertEqual((match.w, match.h), (120, 130))
+
+
+@unittest.skipIf(af is None, "opencv/numpy/pure-python-adb not installed")
+class MultiDeviceTests(unittest.TestCase):
+    def test_device_config_is_isolated_per_serial(self):
+        base = af.FrameworkConfig()
+        base.adb.device_serials = ["emulator-5554", "10.0.0.5:5555"]
+        first = af.build_device_config(base, "emulator-5554")
+        second = af.build_device_config(base, "10.0.0.5:5555")
+        self.assertEqual(first.adb.device_serial, "emulator-5554")
+        self.assertEqual(first.adb.device_serials, [])
+        self.assertTrue(first.diagnostics.crash_dump_dir.endswith(os.path.join("crash_dumps", "emulator-5554")))
+        self.assertTrue(second.diagnostics.crash_dump_dir.endswith("10.0.0.5_5555"))
+        first.recovery.max_ui_failures = 99
+        self.assertNotEqual(second.recovery.max_ui_failures, 99)
+        self.assertEqual(base.adb.device_serials, ["emulator-5554", "10.0.0.5:5555"])
+
+    def test_network_serial_is_adb_connected(self):
+        config = af.build_device_config(af.FrameworkConfig(), "10.0.0.5:5555")
+        engine = af.AdbEngine(config, threading.Event(), label="10.0.0.5:5555")
+        self.assertEqual(engine._network_endpoints(), [("10.0.0.5", 5555)])
+        self.assertEqual(af.AdbEngine(af.FrameworkConfig(), threading.Event())._network_endpoints(), [])
+
+    def test_device_log_prefix(self):
+        logger = af.device_logger("automation.fsm", "emu-1")
+        self.assertEqual(logger.process("hello", {})[0], "[emu-1] hello")
+        self.assertIs(af.device_logger("automation.fsm", ""), logging.getLogger("automation.fsm"))
+
+    def test_config_rejects_bad_workflow_settings(self):
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"workflow": {"mode": "random"}})
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"workflow": {"mode": "sequence"}, "workflow_targets": [
+                {"name": "a", "template": "a.png", "optional": True}]})
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"adb": {"device_serials": ["a", "a"]}})
+        with self.assertRaises(af.ConfigError):
+            af.FrameworkConfig.from_dict({"diagnostics": {"status_port": 70000}})
 
 
 @unittest.skipIf(af is None, "opencv/numpy/pure-python-adb not installed")

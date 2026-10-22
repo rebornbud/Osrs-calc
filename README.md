@@ -96,6 +96,49 @@ else on the same screen. `--from screen.png` works on a saved screenshot instead
 {"name": "scroll_feed", "template": "feed_header.png", "action": "swipe", "swipe_vector": [0.0, -0.45]}
 ```
 
+### Sequences
+
+By default (`"workflow": {"mode": "priority"}`) every scan acts on the first visible target in list
+order. In `"sequence"` mode the targets are ordered steps: only the current step is searched, and
+the sequence moves on once that step's action is confirmed.
+
+```json
+"workflow": {"mode": "sequence", "max_cycles": 50, "optional_skip_after_scans": 2},
+"workflow_targets": [
+  {"name": "open_menu", "template": "menu.png"},
+  {"name": "dismiss_banner", "template": "banner_close.png", "optional": true},
+  {"name": "confirm", "template": "confirm.png"}
+]
+```
+
+- `optional` steps are skipped after they fail to appear for `optional_skip_after_scans` scans.
+- `max_cycles` stops cleanly after that many full passes (`0` = run forever). In priority mode,
+  `max_actions` does the same based on confirmed actions.
+- After a Tier 1 or Tier 2 recovery the sequence restarts from the first step. Set
+  `restart_sequence_after_recovery` to `false` to resume where it left off.
+
+### Multiple emulators
+
+```bash
+python3 automation_framework.py --config config.json --serial emulator-5554,emulator-5556,10.0.0.5:5555
+```
+
+Each serial gets its own state machine, thread, counters and crash dump folder
+(`crash_dumps/<serial>/`). Log lines are prefixed with `[serial]`. A Tier 3 shutdown on one device does
+not stop the others. Serials in `host:port` form are attached with `adb connect` automatically.
+The same list can go in the config as `"adb": {"device_serials": [...]}`.
+
+### Live status page
+
+```bash
+python3 automation_framework.py --config config.json --status-port 8765   # open http://127.0.0.1:8765/
+```
+
+The page shows each device's state, current step, counters, last error and latest screenshot,
+and refreshes every 3 seconds. `/status.json` has the same data, plus each device's recent state
+transitions, for scripts. It binds to `127.0.0.1` by default. Change `diagnostics.status_host`
+only on a trusted network, because the page serves live screenshots.
+
 ### Different resolutions
 
 Templates must normally be captured at the device's resolution. To reuse them across emulators
@@ -118,4 +161,5 @@ the context, state history, last traceback, config, last screenshot and a logcat
 `recovery.restart_counter_decay_seconds` resets the restart counter after a stable period so that
 runs lasting several days do not slowly drift towards Tier 3. Set it to `0` to make the restart limit absolute.
 
-Exit codes: `0` normal, `1` config error, `2` Tier 3 fatal, `130` interrupted.
+Exit codes: `0` normal (including a reached `max_cycles`/`max_actions`), `1` config error,
+`2` Tier 3 fatal on any device, `130` interrupted.

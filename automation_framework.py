@@ -19,6 +19,7 @@ Usage:         python3 automation_framework.py --write-default-config config.jso
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -35,10 +36,12 @@ import threading
 import time
 import traceback
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 import cv2
 import numpy as np
@@ -77,8 +80,11 @@ class ConfigError(Exception):
 class AdbSettings:
     host: str = "127.0.0.1"
     port: int = 5037
-    # Explicit device serial; None selects the first online emulator.
+    # Explicit device serial; None selects the first online emulator. A
+    # "host:port" serial is attached with `adb connect` automatically.
     device_serial: Optional[str] = None
+    # Several serials run one independent state machine per device.
+    device_serials: List[str] = field(default_factory=list)
     # Set for network-attached devices (equivalent of `adb connect host:port`).
     remote_device_host: Optional[str] = None
     remote_device_port: int = 5555
@@ -187,9 +193,27 @@ class WorkflowTarget:
     # up by 40% of the screen height.
     swipe_vector: List[float] = field(default_factory=lambda: [0.0, -0.4])
     text: Optional[str] = None
+    # Sequence mode only: skip this step when it has not appeared for
+    # workflow.optional_skip_after_scans consecutive scans.
+    optional: bool = False
     # Seconds to wait after the action before verifying the UI changed.
     post_action_delay_seconds: float = 1.2
     verify_change: bool = True
+
+
+@dataclass
+class WorkflowSettings:
+    # "priority": act on the first visible target in list order, every scan.
+    # "sequence": targets are ordered steps; only the current step is searched
+    #             and the sequence advances once its action is confirmed.
+    mode: str = "priority"
+    # Sequence mode: stop cleanly after this many complete passes (0 = forever).
+    max_cycles: int = 0
+    # Priority mode: stop cleanly after this many confirmed actions (0 = forever).
+    max_actions: int = 0
+    optional_skip_after_scans: int = 2
+    # Start the sequence from step 1 after a Tier 1 or Tier 2 recovery.
+    restart_sequence_after_recovery: bool = True
 
 
 @dataclass
@@ -224,6 +248,10 @@ class DiagnosticsSettings:
     log_file: Optional[str] = "automation.log"
     state_history_length: int = 250
     logcat_lines_in_dump: int = 400
+    # Local status page (http://host:port/); None disables it. Keep the host
+    # on 127.0.0.1 unless the network is trusted: the page shows screenshots.
+    status_port: Optional[int] = None
+    status_host: str = "127.0.0.1"
 
 
 @dataclass
@@ -235,6 +263,7 @@ class FrameworkConfig:
     assets: AssetPaths = field(default_factory=AssetPaths)
     timing: TimingSettings = field(default_factory=TimingSettings)
     diagnostics: DiagnosticsSettings = field(default_factory=DiagnosticsSettings)
+    workflow: WorkflowSettings = field(default_factory=WorkflowSettings)
     workflow_targets: List[WorkflowTarget] = field(default_factory=list)
 
     @classmethod
@@ -253,7 +282,7 @@ class FrameworkConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FrameworkConfig":
         known_sections = {"adb", "package", "vision", "recovery", "assets", "timing",
-                          "diagnostics", "workflow_targets"}
+                          "diagnostics", "workflow", "workflow_targets"}
         unknown = set(data) - known_sections
         if unknown:
             raise ConfigError(f"Unknown config sections: {sorted(unknown)}")
@@ -269,6 +298,7 @@ class FrameworkConfig:
                 assets=AssetPaths(**data.get("assets", {})),
                 timing=TimingSettings(**data.get("timing", {})),
                 diagnostics=DiagnosticsSettings(**data.get("diagnostics", {})),
+                workflow=WorkflowSettings(**data.get("workflow", {})),
                 workflow_targets=[WorkflowTarget(**item) for item in data.get("workflow_targets", [])],
             )
         except TypeError as exc:
@@ -343,6 +373,20 @@ class FrameworkConfig:
                 errors.append(f"{label}.long_press_ms must be >= 300")
         if not self.vision.match_scales or not all(0.2 <= s <= 4.0 for s in self.vision.match_scales):
             errors.append("vision.match_scales must be a non-empty list of values in [0.2, 4]")
+        if self.workflow.mode not in ("priority", "sequence"):
+            errors.append("workflow.mode must be 'priority' or 'sequence'")
+        if self.workflow.max_cycles < 0 or self.workflow.max_actions < 0:
+            errors.append("workflow.max_cycles and workflow.max_actions must be >= 0")
+        if self.workflow.optional_skip_after_scans < 1:
+            errors.append("workflow.optional_skip_after_scans must be >= 1")
+        if self.workflow.mode == "sequence" and self.workflow_targets and \
+                all(target.optional for target in self.workflow_targets):
+            errors.append("sequence mode needs at least one non-optional workflow target")
+        if len(set(self.adb.device_serials)) != len(self.adb.device_serials):
+            errors.append("adb.device_serials must be unique")
+        port = self.diagnostics.status_port
+        if port is not None and not (isinstance(port, int) and 1 <= port <= 65535):
+            errors.append("diagnostics.status_port must be an integer in 1-65535")
         if not 0 < self.timing.swipe_fallback_min_ms <= self.timing.swipe_fallback_max_ms:
             errors.append("timing.swipe_fallback_min_ms must be > 0 and <= swipe_fallback_max_ms")
         if errors:
@@ -357,6 +401,16 @@ def build_default_config() -> FrameworkConfig:
             WorkflowTarget(name="confirm_button", template="confirm_button.png", threshold=0.9),
         ]
     )
+
+
+def build_device_config(config: FrameworkConfig, serial: str) -> FrameworkConfig:
+    """Copy of config bound to one device, with its own crash dump folder."""
+    device_config = copy.deepcopy(config)
+    device_config.adb.device_serial = serial
+    device_config.adb.device_serials = []
+    safe_serial = "".join(char if char.isalnum() or char in "-_." else "_" for char in serial)
+    device_config.diagnostics.crash_dump_dir = os.path.join(config.diagnostics.crash_dump_dir, safe_serial)
+    return device_config
 
 
 # =============================================================================
@@ -391,6 +445,18 @@ class ConsoleFormatter(logging.Formatter):
             color = self.COLORS.get(record.levelno, "")
             return f"{color}{line}{self.RESET}"
         return line
+
+
+class DeviceLogAdapter(logging.LoggerAdapter):
+    """Prefixes every message with the device label when several run at once."""
+
+    def process(self, msg: Any, kwargs: Any) -> Tuple[Any, Any]:
+        return f"[{self.extra['device']}] {msg}", kwargs
+
+
+def device_logger(name: str, label: str) -> Any:
+    logger = logging.getLogger(name)
+    return DeviceLogAdapter(logger, {"device": label}) if label else logger
 
 
 def setup_logging(level: str, log_file: Optional[str]) -> logging.Logger:
@@ -461,10 +527,10 @@ class AdbEngine:
     PIXEL_FORMAT_RGBX_8888 = 2
     PIXEL_FORMAT_BGRA_8888 = 5
 
-    def __init__(self, config: FrameworkConfig, stop_event: threading.Event) -> None:
+    def __init__(self, config: FrameworkConfig, stop_event: threading.Event, label: str = "") -> None:
         self.config = config
         self.stop_event = stop_event
-        self.log = logging.getLogger("automation.adb")
+        self.log = device_logger("automation.adb", label)
         self._lock = threading.RLock()
         self._rng = random.Random()
         self.client: Optional[AdbClient] = None
@@ -519,12 +585,9 @@ class AdbEngine:
                         f"Start it with `adb start-server`. ({str(exc).splitlines()[0]})") from exc
             self.log.debug("ADB daemon protocol version %d", version)
 
-            if settings.remote_device_host:
-                connected = client.remote_connect(settings.remote_device_host,
-                                                  settings.remote_device_port)
-                if not connected:
-                    raise DeviceNotConnectedError(
-                        f"`adb connect {settings.remote_device_host}:{settings.remote_device_port}` failed")
+            for remote_host, remote_port in self._network_endpoints():
+                if not client.remote_connect(remote_host, remote_port):
+                    raise DeviceNotConnectedError(f"`adb connect {remote_host}:{remote_port}` failed")
 
             devices = client.devices(state="device")
             if not devices:
@@ -562,6 +625,18 @@ class AdbEngine:
 
         self.log.info("Connected to %s (SDK %d, screen %dx%d, motionevent=%s)",
                       serial, sdk_level, width, height, self.supports_motionevent)
+
+    def _network_endpoints(self) -> List[Tuple[str, int]]:
+        settings = self.config.adb
+        endpoints: List[Tuple[str, int]] = []
+        if settings.remote_device_host:
+            endpoints.append((settings.remote_device_host, settings.remote_device_port))
+        serial = settings.device_serial or ""
+        if ":" in serial:
+            host, port_text = serial.rsplit(":", 1)
+            if host and port_text.isdigit() and (host, int(port_text)) not in endpoints:
+                endpoints.append((host, int(port_text)))
+        return endpoints
 
     def _select_device(self, devices: List[Any]) -> Any:
         settings = self.config.adb
@@ -1107,12 +1182,13 @@ class AutomationController:
     """Drives the INITIALIZE -> SCANNING -> ACTION loop with tiered recovery."""
 
     def __init__(self, config: FrameworkConfig, adb: AdbEngine, vision: VisionEngine,
-                 stop_event: threading.Event) -> None:
+                 stop_event: threading.Event, label: str = "") -> None:
         self.config = config
         self.adb = adb
         self.vision = vision
         self.stop_event = stop_event
-        self.log = logging.getLogger("automation.fsm")
+        self.label = label or config.adb.device_serial or "device"
+        self.log = device_logger("automation.fsm", label)
         self._rng = random.Random()
         self._context_lock = threading.RLock()
         self.state = State.STATE_INITIALIZE
@@ -1138,6 +1214,10 @@ class AutomationController:
             "last_restart_time": None,
             "last_action_time": None,
             "last_error": None,
+            "sequence_index": 0,
+            "optional_miss_counter": 0,
+            "cycles_completed": 0,
+            "workflow_complete": False,
             "started_at": time.time(),
             "state_entered_at": time.time(),
         }
@@ -1170,6 +1250,10 @@ class AutomationController:
         with self._context_lock:
             data = dict(self.context)
         data["state"] = self.state.value
+        data["serial"] = self.adb.serial
+        targets = self.config.workflow_targets
+        if self.config.workflow.mode == "sequence" and targets:
+            data["current_step"] = targets[data["sequence_index"] % len(targets)].name
         pending = data.get("pending_action")
         if pending is not None:
             data["pending_action"] = {"target": pending["target"].name,
@@ -1184,6 +1268,9 @@ class AutomationController:
             self.context["network_dialog_counter"] = 0
             self.context["loading_since"] = None
             self.context["recovery_reason"] = None
+            if self.config.workflow.restart_sequence_after_recovery:
+                self.context["sequence_index"] = 0
+                self.context["optional_miss_counter"] = 0
 
     # ------------------------------------------------------------- transitions
 
@@ -1225,14 +1312,54 @@ class AutomationController:
         self.last_frame = frame
         return frame
 
+    def _match_target(self, frame: np.ndarray, target: WorkflowTarget) -> Optional[MatchResult]:
+        threshold = target.threshold if target.threshold is not None \
+            else self.config.vision.default_match_threshold
+        return self.vision.find_template(frame, self._target_paths[target.name], threshold)
+
     def _find_workflow_target(self, frame: np.ndarray) -> Optional[Tuple[WorkflowTarget, MatchResult]]:
-        for target in self.config.workflow_targets:
-            threshold = target.threshold if target.threshold is not None \
-                else self.config.vision.default_match_threshold
-            match = self.vision.find_template(frame, self._target_paths[target.name], threshold)
+        targets = self.config.workflow_targets
+        if self.config.workflow.mode == "priority":
+            for target in targets:
+                match = self._match_target(frame, target)
+                if match is not None:
+                    return target, match
+            return None
+        # Sequence mode: only the current step counts; optional steps that keep
+        # failing to appear are skipped so the next step can be tried.
+        for _ in range(len(targets)):
+            target = targets[self.ctx_get("sequence_index")]
+            match = self._match_target(frame, target)
             if match is not None:
+                self.ctx_set("optional_miss_counter", 0)
                 return target, match
+            if not target.optional:
+                return None
+            misses = self.ctx_incr("optional_miss_counter")
+            if misses < self.config.workflow.optional_skip_after_scans:
+                return None
+            self.log.info("Optional step '%s' absent for %d scans; skipping it", target.name, misses)
+            self._advance_sequence()
+            if self.ctx_get("workflow_complete"):
+                return None
         return None
+
+    def _advance_sequence(self) -> None:
+        """Move to the next sequence step; completing the last step ends a cycle."""
+        targets = self.config.workflow_targets
+        workflow = self.config.workflow
+        with self._context_lock:
+            self.context["optional_miss_counter"] = 0
+            index = (self.context["sequence_index"] + 1) % len(targets)
+            self.context["sequence_index"] = index
+            if index != 0:
+                return
+            self.context["cycles_completed"] += 1
+            cycles = self.context["cycles_completed"]
+            if workflow.max_cycles and cycles >= workflow.max_cycles:
+                self.context["workflow_complete"] = True
+        self.log.info("Sequence cycle %d complete%s", cycles,
+                      f" (limit {workflow.max_cycles} reached)" if self.ctx_get("workflow_complete") else "")
 
     def _dismiss_network_dialog(self, frame: np.ndarray) -> None:
         assets = self.config.assets
@@ -1303,11 +1430,11 @@ class AutomationController:
             try:
                 self.adb.connect_device()
             except DeviceNotConnectedError as exc:
+                if self.stop_event.is_set():
+                    return State.STATE_SHUTDOWN
                 cycles = self.ctx_incr("reconnect_cycle_counter")
                 limit = self.config.recovery.max_reconnect_cycles
                 self.log.error("Reconnect cycle %d/%d failed: %s", cycles, limit, exc)
-                if self.stop_event.is_set():
-                    return State.STATE_SHUTDOWN
                 if cycles >= limit:
                     self._tier3_fatal(RecoveryReason.DEVICE_UNREACHABLE, str(exc))
                 self.stop_event.wait(self.config.recovery.reconnect_cycle_delay_seconds)
@@ -1349,6 +1476,9 @@ class AutomationController:
 
     def _handle_scanning(self) -> State:
         recovery = self.config.recovery
+        if self.ctx_get("workflow_complete"):
+            self.log.info("Workflow limit reached; shutting down cleanly")
+            return State.STATE_SHUTDOWN
         scan_cycle = self.ctx_incr("scan_cycle")
         self._maybe_decay_restart_counter()
 
@@ -1385,6 +1515,8 @@ class AutomationController:
         self.ctx_set("loading_since", None)
 
         found = self._find_workflow_target(frame)
+        if self.ctx_get("workflow_complete"):
+            return State.STATE_SHUTDOWN
         if found is not None:
             target, match = found
             self.ctx_set("ui_failure_counter", 0)
@@ -1426,6 +1558,14 @@ class AutomationController:
             total = self.ctx_incr("actions_performed")
             self.log.info("ACTION '%s' confirmed (%.2f%% pixels changed, total actions %d)",
                           target.name, ratio * 100, total)
+            workflow = self.config.workflow
+            if workflow.mode == "sequence":
+                self._advance_sequence()
+            elif workflow.max_actions and total >= workflow.max_actions:
+                self.ctx_set("workflow_complete", True)
+                self.log.info("Action limit %d reached", workflow.max_actions)
+            if self.ctx_get("workflow_complete"):
+                return State.STATE_SHUTDOWN
             return State.STATE_SCANNING
 
         unresponsive = self.ctx_incr("unresponsive_action_counter")
@@ -1665,6 +1805,144 @@ class AutomationController:
 
 
 # =============================================================================
+# LIVE STATUS PAGE
+# =============================================================================
+
+STATUS_PAGE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Automation Status</title>
+<style>
+:root { --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #677085; --line: #e2e5ec;
+        --ok: #1f8a4c; --warn: #b7791f; --bad: #c53030; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #12151b; --card: #1b2029; --text: #e6e9ef; --muted: #98a1b3; --line: #2b3240;
+          --ok: #48bb78; --warn: #ecc94b; --bad: #fc8181; } }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+h1 { font-size: 18px; margin: 0 0 12px; }
+#updated { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+.name { font-weight: 600; overflow-wrap: anywhere; }
+.pill { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+.SCANNING, .ACTION { color: var(--ok); } .INITIALIZE { color: var(--warn); }
+.ERROR_RECOVERY, .SHUTDOWN { color: var(--bad); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+td { padding: 3px 0; border-bottom: 1px solid var(--line); } td:last-child { text-align: right; }
+.err { color: var(--bad); font-size: 12px; margin-top: 8px; overflow-wrap: anywhere; }
+img { display: block; max-width: 100%; max-height: 420px; margin: 10px auto 0; border-radius: 6px;
+      border: 1px solid var(--line); }
+</style></head><body>
+<h1>Automation status</h1><div id="updated">Loading…</div><div class="grid" id="grid"></div>
+<script>
+const FIELDS = [["Step", "current_step"], ["Scans", "scan_cycle"], ["Actions", "actions_performed"],
+  ["Cycles", "cycles_completed"], ["UI failures", "ui_failure_counter"], ["Back rounds", "back_key_attempt_counter"],
+  ["Restarts", "app_restart_counter"], ["Tier 1 recoveries", "recoveries_tier1"],
+  ["Tier 2 recoveries", "recoveries_tier2"], ["Exceptions", "total_exceptions"]];
+function esc(v) { const d = document.createElement("div"); d.textContent = String(v); return d.innerHTML; }
+async function refresh() {
+  try {
+    const data = await (await fetch("status.json", {cache: "no-store"})).json();
+    const cards = Object.entries(data.devices).map(([label, d]) => {
+      const rows = FIELDS.filter(([, k]) => d[k] !== undefined && d[k] !== null)
+        .map(([n, k]) => `<tr><td>${esc(n)}</td><td>${esc(d[k])}</td></tr>`).join("");
+      const up = Math.floor(data.time - d.started_at);
+      const uptime = `${Math.floor(up / 3600)}h ${Math.floor(up % 3600 / 60)}m`;
+      const err = d.last_error ? `<div class="err">${esc(d.last_error)}</div>` : "";
+      return `<div class="card"><div class="head"><span class="name">${esc(label)}</span>` +
+        `<span class="pill ${esc(d.state)}">${esc(d.state)}</span></div>` +
+        `<table><tr><td>Uptime</td><td>${uptime}</td></tr>${rows}</table>${err}` +
+        `<img alt="Last screenshot of ${esc(label)}" src="screenshot/${encodeURIComponent(label)}.png?t=${Date.now()}"></div>`;
+    });
+    document.getElementById("grid").innerHTML = cards.join("");
+    document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("updated").textContent = "Status unavailable: " + e;
+  }
+}
+refresh(); setInterval(refresh, 3000);
+</script></body></html>
+"""
+
+
+class StatusServer:
+    """Serves / (HTML), /status.json and /screenshot/<label>.png on a daemon thread."""
+
+    def __init__(self, host: str, port: int, controllers: Dict[str, "AutomationController"]) -> None:
+        self.controllers = controllers
+        self.log = logging.getLogger("automation.status")
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server naming
+                server.handle(self)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                server.log.debug("%s %s", self.address_string(), format % args)
+
+        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.httpd.daemon_threads = True
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="status-server", daemon=True)
+
+    @property
+    def url(self) -> str:
+        host, port = self.httpd.server_address[:2]
+        return f"http://{host}:{port}/"
+
+    def start(self) -> None:
+        self.thread.start()
+        self.log.info("Status page at %s", self.url)
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def status_payload(self) -> Dict[str, Any]:
+        devices = {}
+        for label, controller in self.controllers.items():
+            snapshot = controller.snapshot()
+            snapshot["recent_transitions"] = list(controller.history)[-15:]
+            devices[label] = snapshot
+        return {"time": time.time(), "devices": devices}
+
+    def handle(self, request: BaseHTTPRequestHandler) -> None:
+        path = request.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self._send(request, 200, "text/html; charset=utf-8", STATUS_PAGE_HTML.encode("utf-8"))
+        elif path in ("/status", "/status.json"):
+            body = json.dumps(self.status_payload(), default=str).encode("utf-8")
+            self._send(request, 200, "application/json", body)
+        elif path.startswith("/screenshot/") and path.endswith(".png"):
+            label = unquote(path[len("/screenshot/"):-len(".png")])
+            controller = self.controllers.get(label)
+            frame = controller.last_frame if controller is not None else None
+            if frame is None:
+                self._send(request, 404, "text/plain", b"no screenshot yet")
+                return
+            ok, png = cv2.imencode(".png", frame)
+            if not ok:
+                self._send(request, 500, "text/plain", b"encode failed")
+                return
+            self._send(request, 200, "image/png", png.tobytes())
+        else:
+            self._send(request, 404, "text/plain", b"not found")
+
+    @staticmethod
+    def _send(request: BaseHTTPRequestHandler, code: int, content_type: str, body: bytes) -> None:
+        try:
+            request.send_response(code)
+            request.send_header("Content-Type", content_type)
+            request.send_header("Content-Length", str(len(body)))
+            request.send_header("Cache-Control", "no-store")
+            request.end_headers()
+            request.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+# =============================================================================
 # SECTION 5: THREAD-SAFE RUNNER & MAIN INSTANTIATION
 # =============================================================================
 
@@ -1673,7 +1951,7 @@ class AutomationRunner(threading.Thread):
     receive KeyboardInterrupt / SIGTERM and request a clean stop."""
 
     def __init__(self, controller: AutomationController) -> None:
-        super().__init__(name="automation-fsm", daemon=True)
+        super().__init__(name=f"automation-fsm-{controller.label}", daemon=True)
         self.controller = controller
         self.exit_code = EXIT_OK
 
@@ -1691,7 +1969,8 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser.add_argument("--config", help="path to a JSON config file")
     parser.add_argument("--write-default-config", metavar="PATH",
                         help="write an example config to PATH and exit")
-    parser.add_argument("--serial", help="override adb.device_serial")
+    parser.add_argument("--serial", help="device serial, or several comma-separated serials to run in parallel")
+    parser.add_argument("--status-port", type=int, help="serve the live status page on this port")
     parser.add_argument("--package", help="override package.package_name")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args(argv)
@@ -1709,9 +1988,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         config = FrameworkConfig.from_json(args.config) if args.config else FrameworkConfig()
         if args.serial:
-            config.adb.device_serial = args.serial
+            serials = [serial.strip() for serial in args.serial.split(",") if serial.strip()]
+            config.adb.device_serials = serials if len(serials) > 1 else []
+            config.adb.device_serial = serials[0] if len(serials) == 1 else None
         if args.package:
             config.package.package_name = args.package
+        if args.status_port is not None:
+            config.diagnostics.status_port = args.status_port
         config.validate()
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
@@ -1725,19 +2008,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         main_log.warning("package.package_name is still the example value %s", DEFAULT_PACKAGE_NAME)
     if not config.workflow_targets:
         main_log.warning("No workflow_targets configured: every scan will count as a UI failure")
+    main_log.info("Workflow mode: %s (%d targets)", config.workflow.mode, len(config.workflow_targets))
 
     stop_event = threading.Event()
-    adb = AdbEngine(config, stop_event)
     vision = VisionEngine(config)
-
     asset_paths = [config.assets.resolve(name) for name in (
         config.assets.home_anchor, config.assets.loading_anchor, config.assets.network_dialog_anchor)]
     asset_paths += [config.assets.resolve(target.template) for target in config.workflow_targets]
     loaded = vision.preload(asset_paths)
     main_log.info("Templates loaded: %d/%d", sum(loaded.values()), len(loaded))
 
-    controller = AutomationController(config, adb, vision, stop_event)
-    runner = AutomationRunner(controller)
+    if config.adb.device_serials:
+        device_configs = [(serial, build_device_config(config, serial)) for serial in config.adb.device_serials]
+        main_log.info("Running %d devices: %s", len(device_configs), ", ".join(config.adb.device_serials))
+    else:
+        device_configs = [("", config)]
+
+    controllers: Dict[str, AutomationController] = {}
+    runners: List[AutomationRunner] = []
+    for label, device_config in device_configs:
+        adb = AdbEngine(device_config, stop_event, label=label)
+        controller = AutomationController(device_config, adb, vision, stop_event, label=label)
+        controllers[controller.label] = controller
+        runners.append(AutomationRunner(controller))
+
+    status_server: Optional[StatusServer] = None
+    if config.diagnostics.status_port is not None:
+        try:
+            status_server = StatusServer(config.diagnostics.status_host, config.diagnostics.status_port, controllers)
+            status_server.start()
+        except OSError as exc:
+            main_log.error("Status page disabled: cannot bind %s:%d (%s)",
+                           config.diagnostics.status_host, config.diagnostics.status_port, exc)
+            status_server = None
 
     def request_stop(signum: int, _frame: Any) -> None:
         main_log.warning("Signal %d received; stopping after the current step", signum)
@@ -1746,29 +2049,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, request_stop)
 
-    runner.start()
+    for runner in runners:
+        runner.start()
     interrupted = False
     try:
-        while runner.is_alive():
-            runner.join(timeout=0.5)
+        while any(runner.is_alive() for runner in runners):
+            for runner in runners:
+                runner.join(timeout=0.2)
     except KeyboardInterrupt:
         interrupted = True
         main_log.warning("KeyboardInterrupt: stopping (press Ctrl+C again to force)")
         stop_event.set()
         try:
-            runner.join(timeout=30)
+            deadline = time.monotonic() + 30
+            for runner in runners:
+                runner.join(timeout=max(0.0, deadline - time.monotonic()))
         except KeyboardInterrupt:
             main_log.critical("Forced exit")
             return EXIT_INTERRUPTED
-        if runner.is_alive():
-            main_log.error("Worker did not stop within 30s; exiting anyway")
+        if any(runner.is_alive() for runner in runners):
+            main_log.error("Workers did not stop within 30s; exiting anyway")
 
-    summary = controller.snapshot()
-    main_log.info("Final: actions %d, scans %d, tier1 %d, tier2 %d, exceptions %d",
-                  summary["actions_performed"], summary["scan_cycle"], summary["recoveries_tier1"],
-                  summary["recoveries_tier2"], summary["total_exceptions"])
+    if status_server is not None:
+        status_server.stop()
+    for label, controller in controllers.items():
+        summary = controller.snapshot()
+        main_log.info("Final [%s]: actions %d, scans %d, cycles %d, tier1 %d, tier2 %d, exceptions %d",
+                      label, summary["actions_performed"], summary["scan_cycle"], summary["cycles_completed"],
+                      summary["recoveries_tier1"], summary["recoveries_tier2"], summary["total_exceptions"])
     logging.shutdown()
-    return EXIT_INTERRUPTED if interrupted else runner.exit_code
+    if interrupted:
+        return EXIT_INTERRUPTED
+    return max(runner.exit_code for runner in runners)
 
 
 if __name__ == "__main__":
